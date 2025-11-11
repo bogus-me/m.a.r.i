@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  plex_refresher:
+    image: python:3.11-slim
+    container_name: plex_refresher
+    working_dir: /app
+    volumes:
+      - /path/to/plex_refresher:/app
+    entrypoint: [ "bash", "/app/entrypoint.sh" ]
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Berlin
