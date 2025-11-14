@@ -2,8 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
+
 Plex Smart-Refresher 2.0 – MODULAR VERSION
-Teil 1/5 – Core, ENV, Logging, Health, CPU, Status
+- Rotierender Segment-Scan pro Bibliothek (MAX_ITEMS_PER_SCAN)
+- SQLite-Zustand (active / cooldown / dead) mit Eskalation & Reaktivierung
+- Verbesserte CPU-Messung (prozessbasiert)
+- Discord-Embed + optional Telegram-Status, beide aktualisieren statt spammen
+- Healthcheck-File & periodische Health-Anzeige
+- Docker-freundliches Logging (Portainer) + kompaktere Struktur
+
 """
 
 # ==============================================================
