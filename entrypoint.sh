@@ -1,23 +1,17 @@
 #!/bin/bash
 set -e
-
 echo "[BOOT] Starte Plex Smart-Refresher Container..."
+cd /app || exit 1
 
-cd /app || {
-    echo "[ERROR] /app nicht gefunden!"
-    exit 1
-}
-
-# === Virtuelle Umgebung aktivieren (falls vorhanden) ===
-if [ -d ".venv" ]; then
+if [ ! -d ".venv" ]; then
+    echo "[SETUP] Erstelle virtuelle Umgebung und installiere Abhängigkeiten..."
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install --upgrade pip
+    pip install --no-cache-dir -r requirements.txt
+else
     source .venv/bin/activate
     echo "[OK] Virtuelle Umgebung aktiviert."
-else
-    echo "[WARN] Keine virtuelle Umgebung gefunden – starte mit globalem Python."
 fi
 
-echo "[RUN] Starte plex_refresh.py ..."
-python3 plex_refresh.py || {
-    echo "[ERROR] plex_refresh.py abgestürzt!"
-    exit 1
-}
+exec .venv/bin/python plex_refresh.py
