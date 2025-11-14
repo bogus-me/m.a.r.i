@@ -16,7 +16,7 @@ Einmal eingerichtet sorgt M.A.R.I. dafür, dass Plex jederzeit sauber, konsisten
 
 ---
 
-### 2. Intents aktivieren
+### 2. Intents aktivieren (siehe Screenshots)
 Aktiviere unter **Privileged Gateway Intents**:
 
 - Presence Intent  
