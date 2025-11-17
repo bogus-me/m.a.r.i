@@ -1,0 +1,7 @@
+python-dotenv
+psutil
+plexapi
+discord.py
+aiogram
+requests
+urllib3
