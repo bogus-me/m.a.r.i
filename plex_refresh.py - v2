@@ -206,7 +206,7 @@ status = {
     "last_refresh_details":"",
     "cpu_line":"—",
     "last_error":"",
-    "stats_block":"",
+    "stats_block":"• Noch keine Statistik",
 }
 
 def load_state():
@@ -640,109 +640,171 @@ _pending_discord = False
 _last_payload = ""
 discord_send_lock = asyncio.Lock()
 
-def _build_payload()->str:
-    s=status
-    nr=str(s["next_run"]).splitlines()
-    line=nr[0] if nr else "—"
-    date=nr[1] if len(nr)>=2 else "—"
+def _build_payload() -> str:
+    s = status
+    nr = str(s["next_run"]).splitlines()
+    line = nr[0] if nr else "—"
+    date = nr[1] if len(nr) >= 2 else "—"
     return "|".join([
         s["status_line"], s["mode"], line, date,
         s["last_refresh"], s["health"], s["last_refresh_details"],
-        s.get("stats_block",""), s["last_error"], s["cpu_line"]
+        s.get("stats_block", ""), s["last_error"], s["cpu_line"]
     ])
+
 
 async def update_discord_embed():
     global _pending_discord
-    _pending_discord=True
+    _pending_discord = True
     await _discord_maybe_send()
 
-async def _discord_maybe_send():
-    global _pending_discord,_last_discord_update,_last_payload
-    async with discord_send_lock:
-        if not _pending_discord: return
-        now=time.time()
-        if now-_last_discord_update < DISCORD_UPDATE_INTERVAL: return
-        _pending_discord=False
-        _last_discord_update=now
 
-        payload=_build_payload()
-        if payload!=_last_payload:
-            _last_payload=payload
+async def _discord_maybe_send():
+    global _pending_discord, _last_discord_update, _last_payload
+    async with discord_send_lock:
+        if not _pending_discord:
+            return
+
+        now = time.time()
+        if now - _last_discord_update < DISCORD_UPDATE_INTERVAL:
+            return
+
+        _pending_discord = False
+        _last_discord_update = now
+
+        payload = _build_payload()
+        if payload != _last_payload:
+            _last_payload = payload
             await _discord_send_core()
+
 
 async def _discord_send_core():
     try:
         await _discord_embed_raw()
     except Exception as e:
-        if ENABLE_DISCORD_IMPORT and isinstance(e,discord.HTTPException) and getattr(e,"status",None)==429:
-            d=float(getattr(e,"retry_after",3))
-            log_sync(f"[DISCORD] 429 – warte {d:.1f}s","DISCORD")
+        # Discord Rate-Limit
+        if ENABLE_DISCORD_IMPORT and isinstance(e, discord.HTTPException) and getattr(e, "status", None) == 429:
+            d = float(getattr(e, "retry_after", 3))
+            log_sync(f"[DISCORD] 429 – warte {d:.1f}s", "DISCORD")
             await asyncio.sleep(d)
             await _discord_embed_raw()
         else:
-            log_sync(f"Discord Fehler: {e}","DISCORD")
+            log_sync(f"Discord Fehler: {e}", "DISCORD")
+
 
 async def _discord_embed_raw():
     if not (ENABLE_DISCORD and ENABLE_DISCORD_IMPORT and DISCORD_CHANNEL_ID):
         return
+
     global bot
-    if bot is None: return
+    if bot is None:
+        return
 
-    s=status
-    now=dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    nr=str(s["next_run"]).splitlines()
-    next_line=nr[0] if nr else "—"
-    next_date=nr[1] if len(nr)>=2 else "—"
+    s = status
+    now = dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
-    tmdb_state="🟢 OK" if TMDB_STATUS=="ok" else f"🔴 Fehler – {TMDB_LAST_ERROR or 'unbekannt'}"
-    tmdb_rate=f"{(TMDB_HITS/max(1,TMDB_TRIES)*100):.0f}%" if TMDB_TRIES else "—"
+    # NÄCHSTER LAUF
+    nr = str(s["next_run"]).splitlines()
+    next_line = nr[0] if nr else "—"
+    next_date = nr[1] if len(nr) >= 2 else "—"
 
+    # TMDB
+    tmdb_state = "🟢 OK" if TMDB_STATUS == "ok" else f"🔴 Fehler – {TMDB_LAST_ERROR or 'unbekannt'}"
+    tmdb_rate = f"{(TMDB_HITS / max(1, TMDB_TRIES) * 100):.0f}%" if TMDB_TRIES else "—"
+
+    # ---------------------------------------------------------
+    # SYSTEMSTATUS – INTELLIGENT
+    # ---------------------------------------------------------
+    sl = s["status_line"].splitlines()
+
+    if len(sl) >= 3:
+        # Vollformat: Library · Progress · ETA
+        lib_line      = sl[0]
+        progress_line = sl[1]
+        eta_raw       = sl[2].replace("ETA: ", "")
+
+        # Wenn ETA noch nicht berechenbar → kein "REFRESH –"
+        if eta_raw.lower().startswith("berechne"):
+            system_block = (
+                f"• {lib_line}\n"
+                f"• {progress_line}\n"
+                f"• ETA: {eta_raw}"
+            )
+        else:
+            # Normale Phase → Modus + ETA
+            system_block = (
+                f"• {lib_line}\n"
+                f"• {progress_line}\n"
+                f"• {s['mode']} – ETA: {eta_raw}"
+            )
+
+    else:
+        # Kompaktmodus
+        main_line = sl[0] if sl else "Status unbekannt"
+        system_block = (
+            f"• {main_line}\n"
+            f"• Modus: {s['mode']}"
+        )
+
+    # ---------------------------------------------------------
+    # EMBED – Beschreibung
+    # ---------------------------------------------------------
     desc = (
         f"**SYSTEMSTATUS**\n"
-        f"• {s['status_line']}\n"
-        f"• Modus: {s['mode']}\n\n"
+        f"{system_block}\n\n"
+
         f"**PLANUNG**\n"
+        f"• Letzter Lauf: {s['last_refresh'].split(' – ')[0].replace('–','-')}\n"
         f"• Nächster Lauf: {next_line}\n"
         f"• Datum: {next_date}\n\n"
-        f"**LETZTER LAUF**\n"
-        f"• {s['last_refresh']}\n\n"
+
         f"**HEALTH**\n"
         f"• {s['health']}\n\n"
+
         f"**TMDB**\n"
         f"• Status: {tmdb_state}\n"
         f"• Trefferquote: {tmdb_rate}\n"
         f"• Letzter Lookup: {fmt_tmdb_dt(TMDB_LAST_LOOKUP)}\n"
         f"• Letzter Check: {fmt_tmdb_dt(TMDB_LAST_CHECK)}\n\n"
+
         f"**STATS**\n"
         f"{s.get('stats_block','Noch keine Stats.')}\n"
     )
 
-    if len(desc)>4000:
+    if len(desc) > 4000:
         desc = desc[:4000] + "\n… (gekürzt)"
 
+    # Embed-Farbe
     color = (
-        0xFF0000 if s["mode"]=="ERROR"
-        else 0xFFA500 if s["mode"]!="IDLE"
+        0xFF0000 if s["mode"] == "ERROR"
+        else 0xFFA500 if s["mode"] != "IDLE"
         else 0x00FF00
     )
 
-    emb=discord.Embed(description=desc,color=color)
+    emb = discord.Embed(description=desc, color=color)
     emb.set_footer(text=f"Aktualisiert: {now}")
 
+    # Nachricht aktualisieren / erstellen
     ch = bot.get_channel(DISCORD_CHANNEL_ID) or await bot.fetch_channel(DISCORD_CHANNEL_ID)
 
     async with state_lock:
+        # WICHTIG: Status immer sichern!
+        msg_state["last_status"] = status
+        save_state(msg_state)
+
         mid = msg_state.get("discord_main")
         try:
             if mid:
-                msg=await ch.fetch_message(mid)
+                msg = await ch.fetch_message(mid)
                 await msg.edit(embed=emb)
                 return
         except:
             pass
 
-        msg=await ch.send(embed=emb)
-        msg_state["discord_main"]=msg.id
+        msg = await ch.send(embed=emb)
+        msg_state["discord_main"] = msg.id
+
+        # Auch hier: Status speichern
+        msg_state["last_status"] = status
         save_state(msg_state)
 
 # =====================================================================
@@ -782,7 +844,11 @@ async def update_telegram_message():
     txt+=f"\n\n⏱️ <i>Aktualisiert:</i> {now}"
 
     async with state_lock:
-        mid=msg_state.get("telegram_main")
+        # WICHTIG: Status IMMER speichern
+        msg_state["last_status"] = status
+        save_state(msg_state)
+
+        mid = msg_state.get("telegram_main")
         try:
             if mid:
                 await tg_bot.edit_message_text(
@@ -795,12 +861,16 @@ async def update_telegram_message():
         except:
             pass
 
-        sent=await tg_bot.send_message(
+        sent = await tg_bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=txt,
             parse_mode="HTML"
         )
-        msg_state["telegram_main"]=sent.message_id
+
+        msg_state["telegram_main"] = sent.message_id
+
+        # Status erneut speichern
+        msg_state["last_status"] = status
         save_state(msg_state)
 
 async def update_embed():
@@ -1018,67 +1088,80 @@ async def smart_refresh_loop():
             "status_line": f"Bereit – Plex {status['plex_name']}",
             "next_run": next_run_human(tgt)
         })
-        log_sync(f"Nächster Lauf: {human_until(tgt)}","SCHED")
+        log_sync(f"Nächster Lauf: {human_until(tgt)}", "SCHED")
         await update_embed()
 
-        await asyncio.sleep(max(0,(tgt-dt.datetime.now()).total_seconds()))
+        # Auf nächsten Lauf warten
+        await asyncio.sleep(max(0, (tgt - dt.datetime.now()).total_seconds()))
 
         # -------------------------------------------------------------
         # SCAN START
         # -------------------------------------------------------------
         start_ts = dt.datetime.now()
-        log_sync("="*80,"REFRESH")
-        log_sync(f"SCAN START {start_ts:%d.%m.%Y %H:%M:%S}","REFRESH")
+        log_sync("=" * 80, "REFRESH")
+        log_sync(f"SCAN START {start_ts:%d.%m.%Y %H:%M:%S}", "REFRESH")
 
         status.update({
-            "mode":"REFRESH",
-            "status_line":f"🔄 Läuft ({status['plex_name']})",
-            "next_run":"— Lauf aktiv —",
-            "last_error":""
+            "mode": "REFRESH",
+            "next_run": "— Lauf aktiv —",
+            "last_error": "",
+            "status_line": (
+                f"🔄 Läuft ({status['plex_name']}) – Lade…\n"
+                f"Fortschritt: Berechne…\n"
+                f"ETA: Berechne…"
+            )
         })
         await update_embed()
 
         # Laufbasierte Logs leeren
-        for n in ("failed.log","dead.log","recovered.log"):
-            try: open(os.path.join(LOG_DIR,n),"w").close()
-            except: pass
+        for n in ("failed.log", "dead.log", "recovered.log"):
+            try:
+                open(os.path.join(LOG_DIR, n), "w").close()
+            except:
+                pass
 
+        # Reset Stats
         stats_checked = stats_fixed = stats_failed = stats_skip = stats_new_dead = 0
         refreshed_libs = []
+
         time_limit = dt.timedelta(seconds=SCAN_TIME_LIMIT_SECONDS)
 
+        # Libraries holen
         try:
-            sections=[s for s in plex.library.sections() if s.type in("movie","show")]
+            sections = [s for s in plex.library.sections() if s.type in ("movie", "show")]
         except Exception as e:
-            msg=f"Bibliotheken-Fehler: {e}"
-            log_sync(msg,"REFRESH")
-            status.update({"mode":"ERROR","status_line":msg,"last_error":msg})
+            msg = f"Bibliotheken-Fehler: {e}"
+            log_sync(msg, "REFRESH")
+            status.update({"mode": "ERROR", "status_line": msg, "last_error": msg})
             write_health(False)
             await update_embed()
             continue
 
-        total_secs=len(sections) or 1
+        total_secs = len(sections) or 1
 
         # -------------------------------------------------------------
         # LIB-BY-LIB
         # -------------------------------------------------------------
-        for idx,sec in enumerate(sections, start=1):
+        for idx, sec in enumerate(sections, start=1):
 
-            if dt.datetime.now()-start_ts >= time_limit:
-                log_sync("Zeitlimit erreicht – Abbruch.","REFRESH")
+            # Zeitlimit erreicht?
+            if dt.datetime.now() - start_ts >= time_limit:
+                log_sync("Zeitlimit erreicht – Abbruch.", "REFRESH")
                 break
 
             lib = sec.title
-
-            # LOGGEN WELCHE LIB JETZT DRAN IST
             log_sync(f"Starte Library: {lib} ({idx}/{total_secs})", "REFRESH")
 
-            # --- EXCLUDE LIBRARIES – komplette Sektion überspringen ---
+            # ---------------------------------------------------------
+            # EXCLUDE LIBRARIES – werden NACH Progress berechnet geskippt
+            # ---------------------------------------------------------
             if lib in EXCLUDE_LIBRARIES:
                 log_sync(f"[EXCLUDE] Bibliothek übersprungen: {lib}", "REFRESH")
                 continue
 
-            # ---- Library laden + Runtime messen ----
+            # ---------------------------------------------------------
+            # Library laden
+            # ---------------------------------------------------------
             start_load = time.time()
 
             try:
@@ -1087,7 +1170,7 @@ async def smart_refresh_loop():
                     None, lambda: sec.all(sort="updatedAt:desc")
                 )
             except:
-                log_sync(f"{lib} – Plex offline → Pause","REFRESH")
+                log_sync(f"{lib} – Plex offline → Pause", "REFRESH")
                 status["mode"] = "PAUSE"
                 status["status_line"] = "⏸️ Plex offline."
                 await update_embed()
@@ -1097,36 +1180,29 @@ async def smart_refresh_loop():
             load_time = time.time() - start_load
             item_count = len(all_items) if all_items else 0
 
-            # NEW: Runtime-Log
             log_sync(
                 f"{lib} geladen ({item_count} Items, {load_time:.1f}s)",
                 "REFRESH"
             )
 
-            now_dt=dt.datetime.now()
+            # ---------------------------------------------------------
+            # ITEM SORTING
+            # ---------------------------------------------------------
+            now_dt = dt.datetime.now()
             lookback = now_dt - dt.timedelta(days=SMART_LOOKBACK_DAYS)
 
-            ready_list=[]; new_list=[]; changed_list=[]
+            ready_list = []
+            new_list = []
+            changed_list = []
 
-            # ---------------------------------------------------------
-            # LIB ITEM SORTING
-            # ---------------------------------------------------------
             for itm in all_items:
-
-                # EXCLUDED LIB? (superschneller Full-Skip)
-                if sec.title in EXCLUDE_LIBRARIES:
-                    # Wird nicht geloggt (optional), weil Sorting-Phase extrem häufig ist
-                    continue
-
-                if len(ready_list) + len(new_list) + len(changed_list) >= MAX_ITEMS_PER_RUN:
-                    break
 
                 rk = str(getattr(itm, "ratingKey", "") or "")
                 upd = getattr(itm, "updatedAt", None)
                 upd_iso = upd.isoformat() if upd else ""
                 row = db_get_media(rk)
 
-                # Cooldown / Dead skip
+                # Cooldown / Dead skippen
                 if row and row["ignore_until"]:
                     try:
                         ign = dt.datetime.fromisoformat(row["ignore_until"])
@@ -1136,17 +1212,16 @@ async def smart_refresh_loop():
                     except:
                         pass
 
-
                 is_new = row is None
                 is_changed = (
-                    upd_iso and row
-                    and upd_iso != (row["last_updated_at"] or "")
-                    and upd and upd>=lookback
+                    upd_iso and row and
+                    upd_iso != (row["last_updated_at"] or "") and
+                    upd and upd >= lookback
                 )
                 ready_problem = (
-                    row and row["state"] in ("cooldown","dead")
-                    and (not row["ignore_until"] or
-                         dt.datetime.fromisoformat(row["ignore_until"]) <= now_dt)
+                    row and row["state"] in ("cooldown", "dead") and
+                    (not row["ignore_until"] or
+                     dt.datetime.fromisoformat(row["ignore_until"]) <= now_dt)
                 )
 
                 if ready_problem:
@@ -1156,116 +1231,127 @@ async def smart_refresh_loop():
                 elif is_changed:
                     changed_list.append(itm)
 
-            selected=(ready_list+new_list+changed_list)[:MAX_ITEMS_PER_RUN]
-            if not selected:
-                log_sync(f"{lib}: keine Items.","REFRESH")
-                continue
-
-            # ---------------------------------------------------------
-            # PROCESS ITEMS
-            # ---------------------------------------------------------
-            fixed_lib = 0
-
-            for itm in selected:
-
-                # EXCLUDED LIB? → sauber skippen + loggen
-                if lib in EXCLUDE_LIBRARIES:
-                    log_sync(f"[EXCLUDE] {lib} | {itm.title}", "REFRESH")
-                    continue
-
-                # Zeitlimit überschritten?
-                if dt.datetime.now() - start_ts >= time_limit:
+                if len(ready_list) + len(new_list) + len(changed_list) >= MAX_ITEMS_PER_RUN:
                     break
 
-                # Plex Scan? → warten
-                if await plex_is_scanning_async(plex):
-                    await wait_until_plex_ready(plex)
+            selected = (ready_list + new_list + changed_list)[:MAX_ITEMS_PER_RUN]
+            if not selected:
+                log_sync(f"{lib}: keine Items.", "REFRESH")
+                continue
 
-                stats_checked += 1
-                rk = str(getattr(itm, "ratingKey", ""))
-                upd = getattr(itm, "updatedAt", None)
-                upd_iso = upd.isoformat() if upd else ""
+        # -------------------------------------------------------------
+        # PROCESS ITEMS
+        # -------------------------------------------------------------
+        fixed_lib = 0
+
+        for itm in selected:
+
+            # Zeitlimit?
+            if dt.datetime.now() - start_ts >= time_limit:
+                break
+
+            if await plex_is_scanning_async(plex):
+                await wait_until_plex_ready(plex)
+
+            stats_checked += 1
+
+            rk = str(getattr(itm, "ratingKey", ""))
+            upd = getattr(itm, "updatedAt", None)
+            upd_iso = upd.isoformat() if upd else ""
+            row = db_get_media(rk)
+
+            # RECOVERED
+            if row and row["state"] == "dead" and upd_iso != (row["last_updated_at"] or ""):
+                asyncio.create_task(
+                    log_extra("recovered.log",
+                              f"RECOVERED | {lib} | {rk} | {itm.title}")
+                )
+                db_upsert_media(rk, lib, upd_iso, 0, "active", None, "recovered")
                 row = db_get_media(rk)
 
-                # RECOVERED?
-                if row and row["state"] == "dead" and upd_iso != (row["last_updated_at"] or ""):
-                    asyncio.create_task(
-                        log_extra("recovered.log",
-                                f"RECOVERED | {lib} | {rk} | {itm.title}")
-                    )
-                    db_upsert_media(rk, lib, upd_iso, 0, "active", None, "recovered")
-                    row = db_get_media(rk)
+            need, info = needs_refresh(itm)
+            if not need:
+                db_upsert_media(rk, lib, upd_iso, 0, "active", None, None)
+                continue
 
-                # Prüfen, ob Refresh nötig
-                need, info = needs_refresh(itm)
-                if not need:
-                    db_upsert_media(rk, lib, upd_iso, 0, "active", None, None)
-                    continue
+            ok = False
+            try:
+                ok = await refresh_item_and_check(plex, itm)
+            except:
+                status["mode"] = "PAUSE"
+                status["status_line"] = "⏸️ Plex offline."
+                await update_embed()
+                await asyncio.sleep(10)
+                continue
 
-                ok=False
+            if ok:
+                fixed_lib += 1
+                stats_fixed += 1
+                db_upsert_media(rk, lib, upd_iso, 0, "active", None, "fixed")
+                continue
+
+            # TMDB versuchen
+            tmdb_id = tmdb_find_guid_for_item(itm)
+            if tmdb_id:
                 try:
-                    ok=await refresh_item_and_check(plex,itm)
+                    if set_guid(itm, tmdb_id):
+                        fixed_lib += 1
+                        stats_fixed += 1
+                        db_upsert_media(
+                            rk, lib, upd_iso, 0, "active", None, f"guid:{tmdb_id}"
+                        )
+                        continue
                 except:
-                    status["mode"]="PAUSE"
-                    status["status_line"]="⏸️ Plex offline."
+                    status["mode"] = "PAUSE"
+                    status["status_line"] = "⏸️ Plex offline."
                     await update_embed()
                     await asyncio.sleep(10)
                     continue
 
-                if ok:
-                    fixed_lib+=1; stats_fixed+=1
-                    db_upsert_media(rk,lib,upd_iso,0,"active",None,"fixed")
-                    continue
+            stats_failed += 1
+            row = db_get_media(rk)
+            _, dead = handle_failed_item(lib, rk, info, row, upd_iso)
+            if dead:
+                stats_new_dead += 1
 
-                tmdb_id=tmdb_find_guid_for_item(itm)
-                if tmdb_id:
-                    try:
-                        if set_guid(itm,tmdb_id):
-                            fixed_lib+=1; stats_fixed+=1
-                            db_upsert_media(
-                                rk,lib,upd_iso,0,"active",None,f"guid:{tmdb_id}"
-                            )
-                            continue
-                    except:
-                        status["mode"]="PAUSE"
-                        status["status_line"]="⏸️ Plex offline."
-                        await update_embed()
-                        await asyncio.sleep(10)
-                        continue
-
-                stats_failed+=1
-                row=db_get_media(rk)
-                _, dead = handle_failed_item(lib,rk,info,row,upd_iso)
-                if dead: stats_new_dead+=1
-
-            if fixed_lib>0:
-                refreshed_libs.append(f"• {lib}: {fixed_lib} gefixt")
+        if fixed_lib > 0:
+            refreshed_libs.append(f"• {lib}: {fixed_lib} gefixt")
 
         # -------------------------------------------------------------
         # SCAN ENDE
         # -------------------------------------------------------------
-        end_ts=dt.datetime.now()
-        duration=(end_ts-start_ts).total_seconds()
+        end_ts = dt.datetime.now()
+        duration = (end_ts - start_ts).total_seconds()
 
-        avg_cpu = sum(cpu_vals)/len(cpu_vals) if cpu_vals else 0
+        avg_cpu = sum(cpu_vals) / len(cpu_vals) if cpu_vals else 0
         peak_cpu = cpu_peak
 
-        cpu_vals.clear(); cpu_peak=0.0
+        cpu_vals.clear()
+        cpu_peak = 0.0
 
-        main_line=(
+        main_line = (
             f"{stats_fixed} gefixt · "
             f"{stats_failed} fehlgeschlagen · "
             f"{stats_checked} geprüft · Dauer: {format_dur(duration)}"
         )
 
-        status["last_refresh"]=f"{start_ts:%d.%m.%Y %H:%M:%S} – {main_line}"
-        status["last_refresh_details"]="\n".join(refreshed_libs)
-        status["cpu_line"]=f"⌀ {avg_cpu:.1f}% / Peak {peak_cpu:.1f}%"
-        status["status_line"]=f"Refresh abgeschlossen ({status['plex_name']})"
+        status["last_refresh"] = f"{start_ts:%d.%m.%Y %H:%M:%S} – {main_line}"
+        status["last_refresh_details"] = "\n".join(refreshed_libs)
+        status["cpu_line"] = f"⌀ {avg_cpu:.1f}% / Peak {peak_cpu:.1f}%"
+        status["status_line"] = f"🏁 Refresh abgeschlossen ({status['plex_name']})"
+        status["mode"] = "IDLE"
 
-        total_dead=db_count_dead_total()
-        ts_now=dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        status["stats_block"]=(
+        # Nächsten Lauf sofort setzen
+        tgt = next_target_datetime()
+        status["next_run"] = next_run_human(tgt)
+
+        # ---------------------------------------------------------
+        # Stats erzeugen (JETZT – vor update_embed!)
+        # ---------------------------------------------------------
+        total_dead = db_count_dead_total()
+        ts_now = dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+        status["stats_block"] = (
             f"📊 Stats – {ts_now}\n"
             f"• Geprüft: {stats_checked}\n"
             f"• Gefixt: {stats_fixed}\n"
@@ -1276,10 +1362,132 @@ async def smart_refresh_loop():
         )
 
         write_health(True)
+
+        # ---------------------------------------------------------
+        # EIN EINZIGES Update – JETZT mit Stats!
+        # ---------------------------------------------------------
         await update_embed()
 
-        log_sync(f"SCAN ENDE {end_ts:%d.%m.%Y %H:%M:%S} | {main_line}","REFRESH")
-        log_sync("="*80,"REFRESH")
+        log_sync(f"SCAN ENDE {end_ts:%d.%m.%Y %H:%M:%S} | {main_line}", "REFRESH")
+        log_sync("=" * 80, "REFRESH")
+ 
+        # ---------------------------------------------------------
+        # KORREKTER PROGRESS + ETA (auch für EXCLUDE!)
+        # ---------------------------------------------------------
+        elapsed = (dt.datetime.now() - start_ts).total_seconds()
+        progress = idx / total_secs
+
+        bar_len = 12
+        filled = int(progress * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        # ETA
+        if progress > 0:
+            total_est = elapsed / progress
+            eta_sec = max(0, int(total_est - elapsed))
+        else:
+            eta_sec = 0
+
+        if eta_sec < 60:
+            eta_str = f"{eta_sec}s"
+        else:
+            m, s = divmod(eta_sec, 60)
+            eta_str = f"{m}m {s:02d}s"
+
+        status["status_line"] = (
+            f"{lib} ({idx}/{total_secs}) – Lade…\n"
+            f"Fortschritt: {bar} {int(progress * 100)}%\n"
+            f"ETA: {eta_str}"
+        )
+        await update_embed()
+
+        # ---------------------------------------------------------
+        # EXCLUDE LIBRARIES – werden NACH Progress geskippt
+        # ---------------------------------------------------------
+        if lib in EXCLUDE_LIBRARIES:
+            log_sync(f"[EXCLUDE] Bibliothek übersprungen: {lib}", "REFRESH")
+            continue
+
+        # ---------------------------------------------------------
+        # Library laden
+        # ---------------------------------------------------------
+        start_load = time.time()
+
+        try:
+            loop = asyncio.get_running_loop()
+            all_items = await loop.run_in_executor(
+                None, lambda: sec.all(sort="updatedAt:desc")
+            )
+        except:
+            log_sync(f"{lib} – Plex offline → Pause", "REFRESH")
+            status["mode"] = "PAUSE"
+            status["status_line"] = "⏸️ Plex offline."
+            await update_embed()
+            await asyncio.sleep(10)
+            continue
+
+        load_time = time.time() - start_load
+        item_count = len(all_items) if all_items else 0
+
+        log_sync(
+            f"{lib} geladen ({item_count} Items, {load_time:.1f}s)",
+            "REFRESH"
+        )
+
+        # ---------------------------------------------------------
+        # ITEM SORTING
+        # ---------------------------------------------------------
+        now_dt = dt.datetime.now()
+        lookback = now_dt - dt.timedelta(days=SMART_LOOKBACK_DAYS)
+
+        ready_list = []
+        new_list = []
+        changed_list = []
+
+        for itm in all_items:
+
+            rk = str(getattr(itm, "ratingKey", "") or "")
+            upd = getattr(itm, "updatedAt", None)
+            upd_iso = upd.isoformat() if upd else ""
+            row = db_get_media(rk)
+
+            # Cooldown / Dead skip
+            if row and row["ignore_until"]:
+                try:
+                    ign = dt.datetime.fromisoformat(row["ignore_until"])
+                    if ign > now_dt and row["state"] in ("cooldown", "dead"):
+                        stats_skip += 1
+                        continue
+                except:
+                    pass
+
+            is_new = row is None
+            is_changed = (
+                upd_iso and row and
+                upd_iso != (row["last_updated_at"] or "") and
+                upd and upd >= lookback
+            )
+            ready_problem = (
+                row and row["state"] in ("cooldown", "dead") and
+                (not row["ignore_until"] or
+                dt.datetime.fromisoformat(row["ignore_until"]) <= now_dt)
+            )
+
+            if ready_problem:
+                ready_list.append(itm)
+            elif is_new:
+                new_list.append(itm)
+            elif is_changed:
+                changed_list.append(itm)
+
+            if len(ready_list) + len(new_list) + len(changed_list) >= MAX_ITEMS_PER_RUN:
+                break
+
+        selected = (ready_list + new_list + changed_list)[:MAX_ITEMS_PER_RUN]
+        if not selected:
+            log_sync(f"{lib}: keine Items.", "REFRESH")
+            continue
+
 
 # =====================================================================
 # PERIODIC HEALTH CHECK
