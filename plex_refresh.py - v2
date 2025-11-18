@@ -38,6 +38,19 @@ except:
 load_dotenv()
 
 # =====================================================================
+# EXCLUDE-LIBRARIES – werden vollständig vom Fixing ausgeschlossen
+# =====================================================================
+
+EXCLUDE_LIBRARIES = {
+    "Filme - Konzerte",
+    "Filme - Sport",
+    "Filme - Adult",
+    "Filme - O-Ton",
+    "TV - Comedy",
+    "TV - Reality_Soap",
+}
+
+# =====================================================================
 # ENV
 # =====================================================================
 
@@ -1050,27 +1063,45 @@ async def smart_refresh_loop():
         # LIB-BY-LIB
         # -------------------------------------------------------------
         for idx,sec in enumerate(sections, start=1):
+
             if dt.datetime.now()-start_ts >= time_limit:
                 log_sync("Zeitlimit erreicht – Abbruch.","REFRESH")
                 break
 
             lib = sec.title
-            status["status_line"]=f"🔄 {lib} ({idx}/{total_secs})"
-            await update_embed()
-            await wait_until_plex_ready(plex)
+
+            # LOGGEN WELCHE LIB JETZT DRAN IST
+            log_sync(f"Starte Library: {lib} ({idx}/{total_secs})", "REFRESH")
+
+            # --- EXCLUDE LIBRARIES – komplette Sektion überspringen ---
+            if lib in EXCLUDE_LIBRARIES:
+                log_sync(f"[EXCLUDE] Bibliothek übersprungen: {lib}", "REFRESH")
+                continue
+
+            # ---- Library laden + Runtime messen ----
+            start_load = time.time()
 
             try:
-                loop=asyncio.get_running_loop()
+                loop = asyncio.get_running_loop()
                 all_items = await loop.run_in_executor(
                     None, lambda: sec.all(sort="updatedAt:desc")
                 )
             except:
                 log_sync(f"{lib} – Plex offline → Pause","REFRESH")
-                status["mode"]="PAUSE"
-                status["status_line"]="⏸️ Plex offline."
+                status["mode"] = "PAUSE"
+                status["status_line"] = "⏸️ Plex offline."
                 await update_embed()
                 await asyncio.sleep(10)
                 continue
+
+            load_time = time.time() - start_load
+            item_count = len(all_items) if all_items else 0
+
+            # NEW: Runtime-Log
+            log_sync(
+                f"{lib} geladen ({item_count} Items, {load_time:.1f}s)",
+                "REFRESH"
+            )
 
             now_dt=dt.datetime.now()
             lookback = now_dt - dt.timedelta(days=SMART_LOOKBACK_DAYS)
@@ -1081,23 +1112,30 @@ async def smart_refresh_loop():
             # LIB ITEM SORTING
             # ---------------------------------------------------------
             for itm in all_items:
-                if len(ready_list)+len(new_list)+len(changed_list)>=MAX_ITEMS_PER_RUN:
+
+                # EXCLUDED LIB? (superschneller Full-Skip)
+                if sec.title in EXCLUDE_LIBRARIES:
+                    # Wird nicht geloggt (optional), weil Sorting-Phase extrem häufig ist
+                    continue
+
+                if len(ready_list) + len(new_list) + len(changed_list) >= MAX_ITEMS_PER_RUN:
                     break
 
-                rk=str(getattr(itm,"ratingKey","") or "")
-                upd=getattr(itm,"updatedAt",None)
-                upd_iso=upd.isoformat() if upd else ""
-                row=db_get_media(rk)
+                rk = str(getattr(itm, "ratingKey", "") or "")
+                upd = getattr(itm, "updatedAt", None)
+                upd_iso = upd.isoformat() if upd else ""
+                row = db_get_media(rk)
 
                 # Cooldown / Dead skip
                 if row and row["ignore_until"]:
                     try:
-                        ign=dt.datetime.fromisoformat(row["ignore_until"])
-                        if ign>now_dt and row["state"] in ("cooldown","dead"):
-                            stats_skip+=1
+                        ign = dt.datetime.fromisoformat(row["ignore_until"])
+                        if ign > now_dt and row["state"] in ("cooldown", "dead"):
+                            stats_skip += 1
                             continue
                     except:
                         pass
+
 
                 is_new = row is None
                 is_changed = (
@@ -1126,32 +1164,42 @@ async def smart_refresh_loop():
             # ---------------------------------------------------------
             # PROCESS ITEMS
             # ---------------------------------------------------------
-            fixed_lib=0
+            fixed_lib = 0
 
             for itm in selected:
-                if dt.datetime.now()-start_ts >= time_limit:
+
+                # EXCLUDED LIB? → sauber skippen + loggen
+                if lib in EXCLUDE_LIBRARIES:
+                    log_sync(f"[EXCLUDE] {lib} | {itm.title}", "REFRESH")
+                    continue
+
+                # Zeitlimit überschritten?
+                if dt.datetime.now() - start_ts >= time_limit:
                     break
 
+                # Plex Scan? → warten
                 if await plex_is_scanning_async(plex):
                     await wait_until_plex_ready(plex)
 
-                stats_checked+=1
-                rk=str(getattr(itm,"ratingKey",""))
-                upd=getattr(itm,"updatedAt",None)
-                upd_iso=upd.isoformat() if upd else ""
-                row=db_get_media(rk)
+                stats_checked += 1
+                rk = str(getattr(itm, "ratingKey", ""))
+                upd = getattr(itm, "updatedAt", None)
+                upd_iso = upd.isoformat() if upd else ""
+                row = db_get_media(rk)
 
-                # RECOVERED
-                if row and row["state"]=="dead" and upd_iso != (row["last_updated_at"] or ""):
+                # RECOVERED?
+                if row and row["state"] == "dead" and upd_iso != (row["last_updated_at"] or ""):
                     asyncio.create_task(
-                        log_extra("recovered.log",f"RECOVERED | {lib} | {rk} | {itm.title}")
+                        log_extra("recovered.log",
+                                f"RECOVERED | {lib} | {rk} | {itm.title}")
                     )
-                    db_upsert_media(rk,lib,upd_iso,0,"active",None,"recovered")
-                    row=db_get_media(rk)
+                    db_upsert_media(rk, lib, upd_iso, 0, "active", None, "recovered")
+                    row = db_get_media(rk)
 
-                need,info = needs_refresh(itm)
+                # Prüfen, ob Refresh nötig
+                need, info = needs_refresh(itm)
                 if not need:
-                    db_upsert_media(rk,lib,upd_iso,0,"active",None,None)
+                    db_upsert_media(rk, lib, upd_iso, 0, "active", None, None)
                     continue
 
                 ok=False
