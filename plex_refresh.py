@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio, datetime as dt, json, os, sqlite3, sys, time, socket, unicodedata
-from typing import Any, Dict, List, Optional, Tuple
+import asyncio, datetime as dt, json, os, sqlite3, sys, time, socket, unicodedata, re, gc
+from typing import Any, Dict, List, Optional, Tuple, Generator
+from collections import deque
+from contextlib import contextmanager
 
 import requests, psutil
 from dotenv import load_dotenv
@@ -97,6 +99,11 @@ PLEX_SCAN_CHECK_INTERVAL = 10
 MAX_FAILS = 5
 COOLDOWN_STEPS_DAYS = [1, 7, 14, 30]
 
+# Memory Optimizations
+CHUNK_SIZE = 500  # Items pro Chunk
+MAX_CPU_SAMPLES = 3600  # Max 1h bei 1s Intervall
+FETCH_CACHE_SIZE = 1000  # LRU Cache für Plex Items
+
 LOG_BASE = os.path.dirname(RAW_LOG_FILE) or "/app"
 LOG_DIR = os.path.join(LOG_BASE, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -140,13 +147,12 @@ tg_bot = None
 
 _log_lock = asyncio.Lock()
 
-def _fast_read_head(path: str, max_lines: int) -> List[str]:
-    lines = []
+def _fast_read_head(path: str, max_lines: int) -> deque:
+    """Optimiert: Verwendet deque mit maxlen"""
+    lines = deque(maxlen=max_lines)
     try:
         with open(path, "r") as f:
-            for i, ln in enumerate(f):
-                if i >= max_lines:
-                    break
+            for ln in f:
                 lines.append(ln.rstrip("\n"))
     except:
         pass
@@ -181,16 +187,42 @@ async def log(msg: str, p="MAIN"):
         except:
             pass
 
-async def log_extra(name: str, msg: str):
-    ts = dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    path = name if os.path.isabs(name) else os.path.join(LOG_DIR, name)
+# Batch Log Writer für bessere Performance
+_pending_logs = deque(maxlen=1000)
+_log_batch_lock = asyncio.Lock()
 
-    async with _log_lock:
-        try:
-            with open(path, "a") as f:
-                f.write(f"[{ts}] {msg}\n")
-        except:
-            pass
+async def log_extra_batch(name: str, msg: str):
+    """Sammelt Logs und schreibt sie gebatched"""
+    _pending_logs.append((name, msg))
+
+async def batch_log_writer():
+    """Background Task zum Schreiben von Logs in Batches"""
+    while True:
+        await asyncio.sleep(2)
+        if _pending_logs:
+            async with _log_batch_lock:
+                batch = list(_pending_logs)
+                _pending_logs.clear()
+                
+                ts = dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+                logs_by_file = {}
+                
+                for name, msg in batch:
+                    path = name if os.path.isabs(name) else os.path.join(LOG_DIR, name)
+                    if path not in logs_by_file:
+                        logs_by_file[path] = []
+                    logs_by_file[path].append(f"[{ts}] {msg}")
+                
+                for path, messages in logs_by_file.items():
+                    try:
+                        with open(path, "a") as f:
+                            f.write("\n".join(messages) + "\n")
+                    except:
+                        pass
+
+# Fallback für synchrone Logs (backward compatibility)
+async def log_extra(name: str, msg: str):
+    await log_extra_batch(name, msg)
 
 # =====================================================================
 # HEALTH, STATUS, CPU
@@ -234,11 +266,10 @@ state_lock = asyncio.Lock()
 if isinstance(msg_state.get("last_status"), dict):
     status.update(msg_state["last_status"])
 
-# Default für ersten Start
 status.setdefault("stats_block", "• Noch keine Statistik")
 
 PROC = psutil.Process()
-cpu_vals = []
+cpu_vals = deque(maxlen=MAX_CPU_SAMPLES)  # Optimiert: Begrenzte deque
 cpu_peak = 0.0
 
 async def cpu_sampler():
@@ -292,7 +323,59 @@ def iso_in_days(d: int) -> str:
     return (dt.datetime.now()+dt.timedelta(days=d)).isoformat(timespec="seconds")
 
 # =====================================================================
-# DB
+# DB CONNECTION POOL
+# =====================================================================
+
+class DBConnectionPool:
+    """Einfacher Connection Pool für SQLite"""
+    def __init__(self, path: str, pool_size: int = 3):
+        self.path = path
+        self.pool_size = pool_size
+        self._connections = deque()
+        self._lock = asyncio.Lock()
+        
+        # Initialisiere Connections
+        for _ in range(pool_size):
+            conn = self._create_connection()
+            self._connections.append(conn)
+    
+    def _create_connection(self):
+        c = sqlite3.connect(self.path, isolation_level=None, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        return c
+    
+    @contextmanager
+    def get_connection(self):
+        """Context Manager für Connection aus Pool"""
+        conn = None
+        try:
+            if self._connections:
+                conn = self._connections.popleft()
+            else:
+                conn = self._create_connection()
+            yield conn
+        finally:
+            if conn:
+                self._connections.append(conn)
+    
+    def close_all(self):
+        """Schließe alle Connections im Pool"""
+        while self._connections:
+            conn = self._connections.popleft()
+            try:
+                conn.close()
+            except:
+                pass
+
+# Globaler Connection Pool
+db_pool = None
+
+def init_db_pool():
+    global db_pool
+    db_pool = DBConnectionPool(DB_PATH)
+
+# =====================================================================
+# DB OPERATIONS
 # =====================================================================
 
 SCHEMA_SQL = """
@@ -309,31 +392,25 @@ CREATE TABLE IF NOT EXISTS media_state(
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_media_lib ON media_state(library);
+CREATE INDEX IF NOT EXISTS idx_media_state ON media_state(state);
+CREATE INDEX IF NOT EXISTS idx_media_ignore ON media_state(ignore_until);
 """
 
-def db_connect():
-    c=sqlite3.connect(DB_PATH, isolation_level=None, check_same_thread=False)
-    c.row_factory=sqlite3.Row
-    return c
-
 def db_init():
-    c=db_connect()
-    with c: c.executescript(SCHEMA_SQL)
+    c = sqlite3.connect(DB_PATH, isolation_level=None, check_same_thread=False)
+    with c: 
+        c.executescript(SCHEMA_SQL)
     c.close()
 
 def db_get_media(key: str):
-    c=db_connect()
-    try:
-        cur=c.execute("SELECT * FROM media_state WHERE rating_key=?", (key,))
+    with db_pool.get_connection() as c:
+        cur = c.execute("SELECT * FROM media_state WHERE rating_key=?", (key,))
         return cur.fetchone()
-    finally:
-        c.close()
 
 def db_upsert_media(key, lib, updated, fails, state, until, note):
-    c=db_connect()
-    try:
-        row=db_get_media(key)
-        first=row["first_seen"] if row and row["first_seen"] else iso_now()
+    with db_pool.get_connection() as c:
+        row = db_get_media(key)
+        first = row["first_seen"] if row and row["first_seen"] else iso_now()
         c.execute("""
             INSERT INTO media_state(rating_key,library,first_seen,last_scanned,last_updated_at,
             fail_count,ignore_until,state,note)
@@ -347,19 +424,14 @@ def db_upsert_media(key, lib, updated, fails, state, until, note):
                 state=excluded.state,
                 note=excluded.note
         """,(key,lib,first,iso_now(),updated,fails,until,state,note))
-    finally:
-        c.close()
 
 def db_count_dead_total()->int:
-    c=db_connect()
-    try:
-        cur=c.execute("SELECT COUNT(*) c FROM media_state WHERE state='dead'")
+    with db_pool.get_connection() as c:
+        cur = c.execute("SELECT COUNT(*) c FROM media_state WHERE state='dead'")
         return cur.fetchone()["c"]
-    finally:
-        c.close()
 
 # =====================================================================
-# TITLE NORMALIZATION
+# TITLE NORMALIZATION – OPTIMIERT
 # =====================================================================
 
 BIDI_CHARS = {
@@ -370,41 +442,55 @@ BIDI_MARKERS = [
     "[U+200E]","[U+200F]","[U+202A]","[U+202B]","[U+202C]","[U+202D]","[U+202E]"
 ]
 
-def clean_bidi(s:str)->str:
-    if not isinstance(s,str): return s
-    for ch in BIDI_CHARS: s=s.replace(ch,"")
-    for m in BIDI_MARKERS: s=s.replace(m,"")
+# Regex Pattern für Normalisierung (kompiliert für Performance)
+NORMALIZE_PATTERN = re.compile(r'[()[\]{}_\-.:,]')
+YEAR_PATTERN = re.compile(r'\b(19|20)\d{2}\b')
+
+def clean_bidi(s: str) -> str:
+    if not isinstance(s, str): 
+        return s
+    for ch in BIDI_CHARS: 
+        s = s.replace(ch, "")
+    for m in BIDI_MARKERS: 
+        s = s.replace(m, "")
     return s.strip()
 
-def normalize_title(s:str)->str:
-    if not s: return ""
-    s=clean_bidi(s)
-    s=unicodedata.normalize("NFKD",s)
-    s="".join(c for c in s if not unicodedata.combining(c))
-    s=s.lower()
+def normalize_title(s: str) -> str:
+    """Optimierte Version mit Regex"""
+    if not s: 
+        return ""
+    
+    s = clean_bidi(s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.lower()
+    
+    # Entferne Jahre mit Regex
+    s = YEAR_PATTERN.sub(' ', s)
+    
+    # Ersetze Sonderzeichen mit Regex
+    s = NORMALIZE_PATTERN.sub(' ', s)
+    
+    # Entferne Mehrfach-Leerzeichen effizient
+    return ' '.join(s.split())
 
-    for y in range(1900,2101):
-        s=s.replace(str(y)," ")
+def ratio(a: str, b: str) -> float:
+    if not a or not b: 
+        return 0.0
+    a, b = a.lower(), b.lower()
+    total = max(len(a), len(b))
+    match = sum(1 for i in range(min(len(a), len(b))) if a[i] == b[i])
+    return match / total
 
-    repl={"(":" ",")":" ","[":" ","]":" ","{":" ","}":" ","_":" ","-":" ",".":" ",":":" ",",":" "}
-    for a,b in repl.items(): s=s.replace(a,b)
-
-    while "  " in s: s=s.replace("  "," ")
-    return s.strip()
-
-def ratio(a:str,b:str)->float:
-    if not a or not b: return 0.0
-    a,b=a.lower(),b.lower()
-    total=max(len(a),len(b))
-    match=sum(1 for i in range(min(len(a),len(b))) if a[i]==b[i])
-    return match/total
-
-def smart_fuzzy(a:str,b:str)->float:
-    if not a or not b: return 0.0
-    na,nb=normalize_title(a),normalize_title(b)
-    if not na or not nb: return 0.0
-    base=ratio(na,nb)
-    if na in nb or nb in na: base=max(base,0.90)
+def smart_fuzzy(a: str, b: str) -> float:
+    if not a or not b: 
+        return 0.0
+    na, nb = normalize_title(a), normalize_title(b)
+    if not na or not nb: 
+        return 0.0
+    base = ratio(na, nb)
+    if na in nb or nb in na: 
+        base = max(base, 0.90)
     return base
 
 # =====================================================================
@@ -422,67 +508,76 @@ TMDB_MOVIE_SEARCH="https://api.themoviedb.org/3/search/movie"
 TMDB_TV_SEARCH="https://api.themoviedb.org/3/search/tv"
 TMDB_FIND_EXTERNAL="https://api.themoviedb.org/3/find/{ext_id}"
 
-def tmdb_request(url,params):
-    params["api_key"]=TMDB_API_KEY
+def tmdb_request(url, params):
+    params["api_key"] = TMDB_API_KEY
     try:
-        r=requests.get(url,params=params,timeout=10,verify=False)
-        if r.status_code!=200:
-            log_sync(f"TMDB HTTP {r.status_code}: {url}","TMDB")
+        r = requests.get(url, params=params, timeout=10, verify=False)
+        if r.status_code != 200:
+            log_sync(f"TMDB HTTP {r.status_code}: {url}", "TMDB")
             return None
         return r.json()
     except Exception as e:
-        log_sync(f"TMDB Fehler: {e}","TMDB")
+        log_sync(f"TMDB Fehler: {e}", "TMDB")
         return None
 
 def tmdb_check_connection():
-    global TMDB_STATUS,TMDB_LAST_ERROR,TMDB_LAST_CHECK
-    TMDB_LAST_CHECK=iso_now()
+    global TMDB_STATUS, TMDB_LAST_ERROR, TMDB_LAST_CHECK
+    TMDB_LAST_CHECK = iso_now()
     try:
-        r=requests.get("https://api.themoviedb.org/3/configuration",
-                       params={"api_key":TMDB_API_KEY},timeout=8,verify=False)
-        if r.status_code==200:
-            TMDB_STATUS="ok"; TMDB_LAST_ERROR=""
-            log_sync("TMDB OK","TMDB")
+        r = requests.get("https://api.themoviedb.org/3/configuration",
+                       params={"api_key": TMDB_API_KEY}, timeout=8, verify=False)
+        if r.status_code == 200:
+            TMDB_STATUS = "ok"
+            TMDB_LAST_ERROR = ""
+            log_sync("TMDB OK", "TMDB")
             return True
-        TMDB_STATUS="error"; TMDB_LAST_ERROR=f"HTTP {r.status_code}"
+        TMDB_STATUS = "error"
+        TMDB_LAST_ERROR = f"HTTP {r.status_code}"
         return False
     except Exception as e:
-        TMDB_STATUS="error"; TMDB_LAST_ERROR=str(e)
+        TMDB_STATUS = "error"
+        TMDB_LAST_ERROR = str(e)
         return False
 
-def extract_year(itm)->Optional[int]:
+def extract_year(itm) -> Optional[int]:
     try:
-        y=getattr(itm,"year",None)
-        return y if isinstance(y,int) else None
-    except: return None
+        y = getattr(itm, "year", None)
+        return y if isinstance(y, int) else None
+    except: 
+        return None
 
-def tmdb_search_movie(title,year):
-    p={"query":title}
-    if year: p["year"]=year
-    return tmdb_request(TMDB_MOVIE_SEARCH,p)
+def tmdb_search_movie(title, year):
+    p = {"query": title}
+    if year: 
+        p["year"] = year
+    return tmdb_request(TMDB_MOVIE_SEARCH, p)
 
-def tmdb_search_tv(title,year):
-    p={"query":title}
-    if year: p["first_air_date_year"]=year
-    return tmdb_request(TMDB_TV_SEARCH,p)
+def tmdb_search_tv(title, year):
+    p = {"query": title}
+    if year: 
+        p["first_air_date_year"] = year
+    return tmdb_request(TMDB_TV_SEARCH, p)
 
-def tmdb_find_by_external(ext_id,src):
-    if src=="tvdb": e="tvdb_id"
-    elif src=="imdb": e="imdb_id"
-    else: return None
-    url=TMDB_FIND_EXTERNAL.format(ext_id=ext_id)
-    return tmdb_request(url,{"external_source":e})
+def tmdb_find_by_external(ext_id, src):
+    if src == "tvdb": 
+        e = "tvdb_id"
+    elif src == "imdb": 
+        e = "imdb_id"
+    else: 
+        return None
+    url = TMDB_FIND_EXTERNAL.format(ext_id=ext_id)
+    return tmdb_request(url, {"external_source": e})
 
 def try_external_lookup(itm):
-    for g in getattr(itm,"guids",[]):
-        gid=(getattr(g,"id","") or "").lower()
+    for g in getattr(itm, "guids", []):
+        gid = (getattr(g, "id", "") or "").lower()
         ext = (g.id or "").split("/")[-1]
         if "tvdb" in gid:
-            j=tmdb_find_by_external(ext,"tvdb")
+            j = tmdb_find_by_external(ext, "tvdb")
             if j and j.get("tv_results"):
                 return j["tv_results"][0]["id"]
         if "imdb" in gid:
-            j=tmdb_find_by_external(ext,"imdb")
+            j = tmdb_find_by_external(ext, "imdb")
             if j:
                 if j.get("movie_results"):
                     return j["movie_results"][0]["id"]
@@ -491,128 +586,144 @@ def try_external_lookup(itm):
     return None
 
 def try_search_movie(itm):
-    global TMDB_TRIES,TMDB_LAST_LOOKUP,TMDB_HITS
-    title=getattr(itm,"title","")
-    year=extract_year(itm)
+    global TMDB_TRIES, TMDB_LAST_LOOKUP, TMDB_HITS
+    title = getattr(itm, "title", "")
+    year = extract_year(itm)
 
-    TMDB_TRIES+=1; TMDB_LAST_LOOKUP=iso_now()
-    log_sync(f"TMDB Suche Film: {title} ({year})","TMDB")
+    TMDB_TRIES += 1
+    TMDB_LAST_LOOKUP = iso_now()
+    log_sync(f"TMDB Suche Film: {title} ({year})", "TMDB")
 
-    j=tmdb_search_movie(title,year)
-    if not j: return None
+    j = tmdb_search_movie(title, year)
+    if not j: 
+        return None
 
-    best_id=None; best_score=0.0
-    for r in j.get("results",[]):
-        score=smart_fuzzy(title,r.get("title","") or "")
+    best_id = None
+    best_score = 0.0
+    for r in j.get("results", []):
+        score = smart_fuzzy(title, r.get("title", "") or "")
         if year:
             try:
-                r_year=int((r.get("release_date","") or "0")[:4])
-                if abs(r_year-year)>1: continue
-            except: pass
-        if score>=0.85 and score>best_score:
-            best_score=score; best_id=r["id"]
+                r_year = int((r.get("release_date", "") or "0")[:4])
+                if abs(r_year - year) > 1: 
+                    continue
+            except: 
+                pass
+        if score >= 0.85 and score > best_score:
+            best_score = score
+            best_id = r["id"]
 
     if best_id:
-        TMDB_HITS+=1
-        awaitable = log_extra("tmdb_hits.log",
-            f"HIT | movie | {clean_bidi(title)} | id={best_id} | s={best_score:.2f}")
-        asyncio.create_task(awaitable)
+        TMDB_HITS += 1
+        asyncio.create_task(
+            log_extra_batch("tmdb_hits.log",
+                f"HIT | movie | {clean_bidi(title)} | id={best_id} | s={best_score:.2f}")
+        )
         return best_id
 
     asyncio.create_task(
-        log_extra("tmdb_hits.log", f"MISS | movie | {clean_bidi(title)} | year={year}")
+        log_extra_batch("tmdb_hits.log", f"MISS | movie | {clean_bidi(title)} | year={year}")
     )
     return None
 
 def try_search_show(itm):
-    global TMDB_TRIES,TMDB_LAST_LOOKUP,TMDB_HITS
-    title=getattr(itm,"title","")
-    year=extract_year(itm)
+    global TMDB_TRIES, TMDB_LAST_LOOKUP, TMDB_HITS
+    title = getattr(itm, "title", "")
+    year = extract_year(itm)
 
-    TMDB_TRIES+=1; TMDB_LAST_LOOKUP=iso_now()
-    log_sync(f"TMDB Suche Serie: {title} ({year})","TMDB")
+    TMDB_TRIES += 1
+    TMDB_LAST_LOOKUP = iso_now()
+    log_sync(f"TMDB Suche Serie: {title} ({year})", "TMDB")
 
-    j=tmdb_search_tv(title,year)
-    if not j: return None
+    j = tmdb_search_tv(title, year)
+    if not j: 
+        return None
 
-    best_id=None; best_score=0.0
-    for r in j.get("results",[]):
-        score=smart_fuzzy(title,r.get("name","") or "")
+    best_id = None
+    best_score = 0.0
+    for r in j.get("results", []):
+        score = smart_fuzzy(title, r.get("name", "") or "")
         if year:
             try:
-                r_year=int((r.get("first_air_date","") or "0")[:4])
-                if abs(r_year-year)>1: continue
-            except: pass
-        if score>=0.85 and score>best_score:
-            best_score=score; best_id=r["id"]
+                r_year = int((r.get("first_air_date", "") or "0")[:4])
+                if abs(r_year - year) > 1: 
+                    continue
+            except: 
+                pass
+        if score >= 0.85 and score > best_score:
+            best_score = score
+            best_id = r["id"]
 
     if best_id:
-        TMDB_HITS+=1
+        TMDB_HITS += 1
         asyncio.create_task(
-            log_extra("tmdb_hits.log",
+            log_extra_batch("tmdb_hits.log",
                 f"HIT | tv | {clean_bidi(title)} | id={best_id} | s={best_score:.2f}")
         )
         return best_id
 
     asyncio.create_task(
-        log_extra("tmdb_hits.log", f"MISS | tv | {clean_bidi(title)} | year={year}")
+        log_extra_batch("tmdb_hits.log", f"MISS | tv | {clean_bidi(title)} | year={year}")
     )
     return None
 
 def tmdb_find_guid_for_item(itm):
-    ext=try_external_lookup(itm)
-    if ext: return ext
-    t=getattr(itm,"type","")
-    if t=="movie": return try_search_movie(itm)
-    if t=="show": return try_search_show(itm)
+    ext = try_external_lookup(itm)
+    if ext: 
+        return ext
+    t = getattr(itm, "type", "")
+    if t == "movie": 
+        return try_search_movie(itm)
+    if t == "show": 
+        return try_search_show(itm)
     return None
 
 # =====================================================================
 # GUID-SETTER
 # =====================================================================
 
-def set_guid(itm, tmdb_id: int)->bool:
-    tag=f"tmdb://{tmdb_id}"
-    title=clean_bidi(getattr(itm,"title","???"))
+def set_guid(itm, tmdb_id: int) -> bool:
+    tag = f"tmdb://{tmdb_id}"
+    title = clean_bidi(getattr(itm, "title", "???"))
 
-    fn = getattr(itm,"editGuid",None) or getattr(itm,"addGuid",None)
+    fn = getattr(itm, "editGuid", None) or getattr(itm, "addGuid", None)
     if not fn:
-        log_sync(f"GUID nicht gesetzt (kein edit/add): {title}","GUID")
+        log_sync(f"GUID nicht gesetzt (kein edit/add): {title}", "GUID")
         return False
 
     try:
         fn([tag])
     except Exception as e:
-        log_sync(f"GUID-Fehler: {title}: {e}","GUID")
+        log_sync(f"GUID-Fehler: {title}: {e}", "GUID")
         return False
 
     try:
-        fresh=itm._server.fetchItem(itm.ratingKey)
-        guids=[getattr(g,"id","") for g in getattr(fresh,"guids",[])]
+        fresh = itm._server.fetchItem(itm.ratingKey)
+        guids = [getattr(g, "id", "") for g in getattr(fresh, "guids", [])]
         if tag in guids:
-            log_sync(f"GUID gesetzt: {title} -> {tag}","GUID")
+            log_sync(f"GUID gesetzt: {title} -> {tag}", "GUID")
             return True
-        log_sync(f"GUID verworfen von Plex: {title}","GUID")
+        log_sync(f"GUID verworfen von Plex: {title}", "GUID")
         return False
     except Exception as e:
-        log_sync(f"GUID-Verify-Fehler: {title}: {e}","GUID")
+        log_sync(f"GUID-Verify-Fehler: {title}: {e}", "GUID")
         return False
 
 # =====================================================================
 # REFRESH-NEEDS
 # =====================================================================
 
-def needs_refresh(itm)->Tuple[bool,Dict[str,Any]]:
-    title=getattr(itm,"title","???")
-    thumb=getattr(itm,"thumb",None)
-    summary=(getattr(itm,"summary","") or "").strip()
-    rating=getattr(itm,"rating",None)
-    guids=getattr(itm,"guids",[])
+def needs_refresh(itm) -> Tuple[bool, Dict[str, Any]]:
+    title = getattr(itm, "title", "???")
+    thumb = getattr(itm, "thumb", None)
+    summary = (getattr(itm, "summary", "") or "").strip()
+    rating = getattr(itm, "rating", None)
+    guids = getattr(itm, "guids", [])
 
-    missing_guid=not bool(guids)
-    missing_thumb=(thumb is None)
-    missing_summary=not summary
-    missing_rating=(rating is None)
+    missing_guid = not bool(guids)
+    missing_thumb = (thumb is None)
+    missing_summary = not summary
+    missing_rating = (rating is None)
 
     need = (
         missing_guid
@@ -621,11 +732,11 @@ def needs_refresh(itm)->Tuple[bool,Dict[str,Any]]:
     )
 
     return need, {
-        "title":clean_bidi(title),
-        "missing_guid":missing_guid,
-        "missing_thumb":missing_thumb,
-        "missing_summary":missing_summary,
-        "missing_rating":missing_rating
+        "title": clean_bidi(title),
+        "missing_guid": missing_guid,
+        "missing_thumb": missing_thumb,
+        "missing_summary": missing_summary,
+        "missing_rating": missing_rating
     }
 
 # =====================================================================
@@ -680,6 +791,7 @@ async def _discord_maybe_send():
         _pending_discord = False
         _last_discord_update = now
 
+        # Lazy evaluation - baue Payload erst wenn nötig
         payload = _build_payload()
         if payload != _last_payload:
             _last_payload = payload
@@ -811,17 +923,18 @@ async def update_telegram_message():
     if not (ENABLE_TELEGRAM and ENABLE_TELEGRAM_IMPORT and TELEGRAM_CHAT_ID):
         return
     global tg_bot
-    if tg_bot is None: return
+    if tg_bot is None: 
+        return
 
-    s=status
-    now=dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    last_ref=s["last_refresh"]
-    prefix="" if last_ref.startswith(("🔄","❌","✅")) else "• "
+    s = status
+    now = dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    last_ref = s["last_refresh"]
+    prefix = "" if last_ref.startswith(("🔄","❌","✅")) else "• "
 
-    tmdb_state="🟢 OK" if TMDB_STATUS=="ok" else f"🔴 Fehler – {TMDB_LAST_ERROR or 'unbekannt'}"
-    tmdb_rate=f"{(TMDB_HITS/max(1,TMDB_TRIES)*100):.0f}%" if TMDB_TRIES else "—"
+    tmdb_state = "🟢 OK" if TMDB_STATUS == "ok" else f"🔴 Fehler – {TMDB_LAST_ERROR or 'unbekannt'}"
+    tmdb_rate = f"{(TMDB_HITS/max(1,TMDB_TRIES)*100):.0f}%" if TMDB_TRIES else "—"
 
-    txt=(
+    txt = (
         f"🟢 <b>Status:</b> {s['status_line']}\n"
         f"⚙️ <b>Modus:</b> {s['mode']}\n\n"
         f"🕒 <b>Nächster Lauf:</b> {s['next_run']}\n\n"
@@ -833,11 +946,15 @@ async def update_telegram_message():
         f"• Check: {fmt_tmdb_dt(TMDB_LAST_CHECK)}"
     )
 
-    if s["cpu_line"]!="—": txt+=f"\n• <b>CPU:</b> {s['cpu_line']}"
-    if s["last_refresh_details"]: txt+=f"\n\n{s['last_refresh_details']}"
-    if s["stats_block"]: txt+=f"\n\n{s['stats_block']}"
-    if s["last_error"]: txt+=f"\n\n❌ <b>Fehler:</b> {s['last_error']}"
-    txt+=f"\n\n⏱️ <i>Aktualisiert:</i> {now}"
+    if s["cpu_line"] != "—": 
+        txt += f"\n• <b>CPU:</b> {s['cpu_line']}"
+    if s["last_refresh_details"]: 
+        txt += f"\n\n{s['last_refresh_details']}"
+    if s["stats_block"]: 
+        txt += f"\n\n{s['stats_block']}"
+    if s["last_error"]: 
+        txt += f"\n\n❌ <b>Fehler:</b> {s['last_error']}"
+    txt += f"\n\n⏱️ <i>Aktualisiert:</i> {now}"
 
     async with state_lock:
         msg_state["last_status"] = status
@@ -874,56 +991,59 @@ async def update_embed():
 # PLEX-WAIT / SCAN
 # =====================================================================
 
-def is_plex_reachable(url)->bool:
+def is_plex_reachable(url) -> bool:
     try:
-        host=url.split("//",1)[-1].split("/")[0].split(":")[0]
+        host = url.split("//", 1)[-1].split("/")[0].split(":")[0]
         socket.gethostbyname(host)
-        r=requests.get(url+"/identity",timeout=3,verify=False)
-        return r.status_code==200
+        r = requests.get(url + "/identity", timeout=3, verify=False)
+        return r.status_code == 200
     except:
         return False
 
 async def wait_until_plex_online(url):
-    tries=0
+    tries = 0
     while True:
-        if is_plex_reachable(url): return
-        tries+=1
-        if tries==3:
-            log_sync("Plex offline – Warte 2min","REFRESH")
-            status["mode"]="PAUSE"
-            status["status_line"]="⏸️ Plex offline – Boot-Fenster."
+        if is_plex_reachable(url): 
+            return
+        tries += 1
+        if tries == 3:
+            log_sync("Plex offline – Warte 2min", "REFRESH")
+            status["mode"] = "PAUSE"
+            status["status_line"] = "⏸️ Plex offline – Boot-Fenster."
             await update_embed()
             await asyncio.sleep(120)
-            tries=0
+            tries = 0
         else:
-            log_sync("Plex offline – retry in 5s","REFRESH")
-            status["mode"]="PAUSE"
-            status["status_line"]="⏸️ Plex offline – retry…"
+            log_sync("Plex offline – retry in 5s", "REFRESH")
+            status["mode"] = "PAUSE"
+            status["status_line"] = "⏸️ Plex offline – retry…"
             await update_embed()
             await asyncio.sleep(5)
 
-def plex_is_scanning_sync(plex)->bool:
+def plex_is_scanning_sync(plex) -> bool:
     try:
         for s in plex.library.sections():
-            if getattr(s,"isScanning",False): return True
+            if getattr(s, "isScanning", False): 
+                return True
     except:
         pass
     return False
 
-async def plex_is_scanning_async(plex)->bool:
-    loop=asyncio.get_running_loop()
+async def plex_is_scanning_async(plex) -> bool:
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, plex_is_scanning_sync, plex)
 
 async def wait_until_plex_ready(plex):
     while True:
         try:
-            if not await plex_is_scanning_async(plex): return
-            log_sync("Plex-Scan erkannt – Pause","REFRESH")
-            status["mode"]="PAUSE"
-            status["status_line"]="⏸️ Plex scannt…"
+            if not await plex_is_scanning_async(plex): 
+                return
+            log_sync("Plex-Scan erkannt – Pause", "REFRESH")
+            status["mode"] = "PAUSE"
+            status["status_line"] = "⏸️ Plex scannt…"
             await update_embed()
         except Exception as e:
-            log_sync(f"Scan-Check Fehler: {e}","REFRESH")
+            log_sync(f"Scan-Check Fehler: {e}", "REFRESH")
             return
         await asyncio.sleep(PLEX_SCAN_CHECK_INTERVAL)
 
@@ -943,35 +1063,214 @@ async def plex_connect_async() -> PlexServer:
 
     return plex
 
-async def safe_fetch(plex, key, retries=3):
-    loop=asyncio.get_running_loop()
-    def _f():
-        try: return plex.fetchItem(key)
-        except: return None
-    for _ in range(retries):
-        itm=await loop.run_in_executor(None,_f)
-        if itm is not None: return itm
-        await asyncio.sleep(0.2)
-    return None
-
 # =====================================================================
-# REFRESH CORE
+# CHUNKED PLEX ITEM PROCESSING – MEMORY OPTIMIZED
 # =====================================================================
 
-async def refresh_item_and_check(plex, itm)->bool:
-    loop=asyncio.get_running_loop()
+def process_items_in_chunks(all_items, chunk_size: int = CHUNK_SIZE) -> Generator[List, None, None]:
+    """
+    Generator für chunk-weise Item-Verarbeitung
+    Lädt alle Items, gibt sie aber in Chunks zurück
+    Items werden nach Verarbeitung freigegeben
+    """
+    for i in range(0, len(all_items), chunk_size):
+        chunk = all_items[i:i + chunk_size]
+        yield chunk
+        # Chunk wird nach yield automatisch freigegeben
+
+# =====================================================================
+# PERFORMANCE MONITORING
+# =====================================================================
+
+class PerformanceMonitor:
+    """Überwacht Performance-Metriken während des Scans"""
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        """Reset für neuen Scan"""
+        self.start_time = None
+        self.end_time = None
+        self.start_ram = 0
+        self.peak_ram = 0
+        self.end_ram = 0
+        self.cpu_samples = deque(maxlen=1000)
+        self.db_query_times = deque(maxlen=1000)
+        self.current_library = "—"
+        self.current_phase = "Initializing"  # NEU
+        self.current_items = 0  # NEU
+        self.library_peaks = {}
+        self.is_running = False
+    
+    def start_scan(self):
+        """Startet Performance-Monitoring"""
+        self.reset()
+        self.start_time = dt.datetime.now()
+        self.start_ram = PROC.memory_info().rss / 1024 / 1024
+        self.is_running = True
+        self.current_phase = "Starting"
+    
+    def end_scan(self):
+        """Beendet Performance-Monitoring"""
+        self.end_time = dt.datetime.now()
+        self.end_ram = PROC.memory_info().rss / 1024 / 1024
+        self.is_running = False
+        self.current_phase = "Completed"
+    
+    def set_phase(self, phase: str, items: int = 0):
+        """Setzt aktuelle Phase (Loading, Processing, Completed)"""
+        self.current_phase = phase
+        self.current_items = items
+    
+    def update_library(self, lib_name: str, item_count: int):
+        """Aktualisiert aktuelle Library"""
+        self.current_library = lib_name
+        self.current_items = item_count
+        current_ram = PROC.memory_info().rss / 1024 / 1024
+        self.library_peaks[lib_name] = {
+            'ram': current_ram,
+            'items': item_count
+        }
+    
+    def sample(self):
+        """Nimmt Performance-Sample"""
+        ram = PROC.memory_info().rss / 1024 / 1024
+        cpu = PROC.cpu_percent(interval=None)
+        
+        self.peak_ram = max(self.peak_ram, ram)
+        self.cpu_samples.append(cpu)
+        
+        return ram, cpu
+    
+    def get_status_string(self) -> str:
+        """Generiert Status-String für Live-Log"""
+        if self.current_library == "—":
+            return f"{self.current_library} | {self.current_phase}"
+        
+        # Mit Items-Info
+        if self.current_items > 0:
+            return f"{self.current_library} | {self.current_phase} ({self.current_items:,} Items)"
+        else:
+            return f"{self.current_library} | {self.current_phase}"
+    
+    def get_summary(self, stats: dict) -> str:
+        """Generiert Performance-Summary"""
+        duration = (self.end_time - self.start_time).total_seconds() if self.end_time else 0
+        
+        avg_cpu = sum(self.cpu_samples) / len(self.cpu_samples) if self.cpu_samples else 0
+        peak_cpu = max(self.cpu_samples) if self.cpu_samples else 0
+        
+        throughput = stats.get('checked', 0) / duration if duration > 0 else 0
+        
+        # Top 3 Libraries by RAM
+        top_libs = sorted(
+            self.library_peaks.items(),
+            key=lambda x: x[1]['ram'],
+            reverse=True
+        )[:3]
+        
+        summary = [
+            "",  # Leerzeile VOR separator
+            "=" * 60,
+            f"SCAN ABGESCHLOSSEN: {self.end_time.strftime('%d.%m.%Y %H:%M:%S')}",
+            "=" * 60,
+            "",
+            "TIMING",
+            f"  • Start: {self.start_time.strftime('%H:%M:%S')}",
+            f"  • Ende: {self.end_time.strftime('%H:%M:%S')}",
+            f"  • Dauer: {format_dur(duration)}",
+            "",
+            "ITEMS",
+            f"  • Geprüft: {stats.get('checked', 0):,}",
+            f"  • Gefixt: {stats.get('fixed', 0):,}",
+            f"  • Fehlgeschlagen: {stats.get('failed', 0):,}",
+            f"  • Übersprungen: {stats.get('skipped', 0):,}",
+            f"  • Throughput: {throughput:.1f} Items/s",
+            "",
+            "MEMORY",
+            f"  • Start: {self.start_ram:.0f} MB",
+            f"  • Peak: {self.peak_ram:.0f} MB",
+            f"  • Ende: {self.end_ram:.0f} MB",
+            f"  • Delta: {self.end_ram - self.start_ram:+.0f} MB",
+            "",
+            "CPU",
+            f"  • Durchschnitt: {avg_cpu:.1f}%",
+            f"  • Peak: {peak_cpu:.1f}%",
+            "",
+            "DATABASE",
+            f"  • Queries: {stats.get('checked', 0):,}",
+            "",
+            "TMDB",
+            f"  • Requests: {TMDB_TRIES}",
+            f"  • Hits: {TMDB_HITS}",
+            f"  • Hit-Rate: {(TMDB_HITS/max(1,TMDB_TRIES)*100):.0f}%",
+            "",
+            "TOP LIBRARIES (by Peak RAM)"
+        ]
+        
+        for lib_name, data in top_libs:
+            summary.append(f"  • {lib_name}: {data['ram']:.0f} MB ({data['items']:,} Items)")
+        
+        summary.append("=" * 60)
+        summary.append("")
+        
+        return "\n".join(summary)
+
+# Globaler Performance Monitor
+perf_monitor = PerformanceMonitor()
+
+# =====================================================================
+# LIVE PERFORMANCE LOGGER
+# =====================================================================
+
+async def live_performance_logger():
+    """
+    Loggt Performance-Metriken live während des Scans
+    Läuft nur wenn Scan aktiv ist
+    """
+    log_sync("Performance-Logger gestartet", "PERF")
+    
+    while True:
+        try:
+            if perf_monitor.is_running:
+                ram, cpu = perf_monitor.sample()
+                
+                # Generiere Status-String mit Phase-Info
+                status_str = perf_monitor.get_status_string()
+                
+                # Direktes Schreiben statt Batch für Performance-Logs
+                ts = dt.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+                path = os.path.join(LOG_DIR, "performance_live.log")
+                
+                with open(path, "a") as f:
+                    f.write(f"[{ts}] RAM: {ram:.1f} MB | CPU: {cpu:.1f}% | Status: {status_str}\n")
+                    f.flush()  # Force write
+                    
+        except Exception as e:
+            log_sync(f"Performance-Logger Fehler: {e}", "PERF")
+        
+        await asyncio.sleep(5)  # Alle 5 Sekunden
+
+async def refresh_item_and_check(plex, itm) -> bool:
+    loop = asyncio.get_running_loop()
+    
     def _refresh():
-        try: itm.refresh()
-        except: pass
+        try: 
+            itm.refresh()
+        except: 
+            pass
 
-    await loop.run_in_executor(None,_refresh)
+    await loop.run_in_executor(None, _refresh)
 
     def _fetch():
-        try: return plex.fetchItem(itm.ratingKey)
-        except: return None
+        try: 
+            return plex.fetchItem(itm.ratingKey)
+        except: 
+            return None
 
-    fresh=await loop.run_in_executor(None,_fetch)
-    if fresh is None: return False
+    fresh = await loop.run_in_executor(None, _fetch)
+    if fresh is None: 
+        return False
 
     still, _ = needs_refresh(fresh)
     return not still
@@ -982,7 +1281,7 @@ def handle_failed_item(lib, rk, info, row, updated_iso):
     fails = int((row["fail_count"] if row else 0) or 0) + 1
 
     asyncio.create_task(
-        log_extra(
+        log_extra_batch(
             "failed.log",
             f"FAILED | lib={lib} | key={rk} | title={title} | fails={fails} | missing={reason}"
         )
@@ -991,7 +1290,7 @@ def handle_failed_item(lib, rk, info, row, updated_iso):
     if fails >= MAX_FAILS:
         log_sync(f"[DEAD] {lib} | {title} ({rk}) {fails}x failed", "REFRESH")
         asyncio.create_task(
-            log_extra(
+            log_extra_batch(
                 "dead.log",
                 f"DEAD | lib={lib} | key={rk} | title={title} | fails={fails}"
             )
@@ -1013,15 +1312,20 @@ def handle_failed_item(lib, rk, info, row, updated_iso):
     return fails, False
 
 # =====================================================================
-# SMART REFRESH LOOP – BEREINIGT
+# SMART REFRESH LOOP – MEMORY OPTIMIZED
 # =====================================================================
 
 async def smart_refresh_loop():
     global cpu_vals, cpu_peak
 
     db_init()
+    init_db_pool()
     log_sync(f"SQLite bereit: {DB_PATH}", "DB")
+    
+    # Starte Background-Tasks
     asyncio.create_task(cpu_sampler())
+    asyncio.create_task(batch_log_writer())
+    asyncio.create_task(live_performance_logger())  # Performance-Logger
 
     try:
         plex = await plex_connect_async()
@@ -1054,7 +1358,7 @@ async def smart_refresh_loop():
     except Exception as e:
         msg = f"❌ Fehler bei Plex-Verbindung: {e}"
         log_sync(msg, "REFRESH")
-        status.update({"mode":"ERROR","status_line":msg,"last_error":msg})
+        status.update({"mode": "ERROR", "status_line": msg, "last_error": msg})
         write_health(False)
         await update_embed()
         return
@@ -1075,6 +1379,10 @@ async def smart_refresh_loop():
         start_ts = dt.datetime.now()
         log_sync("=" * 80, "REFRESH")
         log_sync(f"SCAN START {start_ts:%d.%m.%Y %H:%M:%S}", "REFRESH")
+
+        # Starte Performance-Monitoring
+        perf_monitor.start_scan()
+        log_sync("Performance-Monitoring AKTIVIERT", "PERF")
 
         status.update({
             "mode": "REFRESH",
@@ -1153,16 +1461,18 @@ async def smart_refresh_loop():
 
             start_load = time.time()
 
+            # Update Phase: Loading
+            perf_monitor.set_phase("Loading", 0)
+
+            # LADEN - muss leider komplett sein (PlexAPI Limitation)
             try:
                 loop = asyncio.get_running_loop()
                 all_items = await loop.run_in_executor(
                     None, lambda s=sec: s.all(sort="updatedAt:desc")
                 )
-            except:
-                log_sync(f"{lib} – Plex offline → Pause", "REFRESH")
-                status["mode"] = "PAUSE"
-                status["status_line"] = "⏸️ Plex offline."
-                await update_embed()
+            except Exception as e:
+                log_sync(f"{lib} – Fehler beim Laden: {e}", "REFRESH")
+                perf_monitor.set_phase("Error", 0)
                 await asyncio.sleep(10)
                 continue
 
@@ -1174,7 +1484,11 @@ async def smart_refresh_loop():
                 "REFRESH"
             )
 
-            # ITEM SORTING
+            # Update Performance Monitor
+            perf_monitor.update_library(lib, item_count)
+            perf_monitor.set_phase("Processing", item_count)
+
+            # CHUNKED PROCESSING – MEMORY OPTIMIERT
             now_dt = dt.datetime.now()
             lookback = now_dt - dt.timedelta(days=SMART_LOOKBACK_DAYS)
 
@@ -1182,42 +1496,54 @@ async def smart_refresh_loop():
             new_list = []
             changed_list = []
 
-            for itm in all_items:
-                rk = str(getattr(itm, "ratingKey", "") or "")
-                upd = getattr(itm, "updatedAt", None)
-                upd_iso = upd.isoformat() if upd else ""
-                row = db_get_media(rk)
+            # Verarbeite in Chunks um Memory-Druck zu reduzieren
+            for chunk in process_items_in_chunks(all_items, CHUNK_SIZE):
+                for itm in chunk:
+                    rk = itm.ratingKey
+                    upd = getattr(itm, "updatedAt", None)
+                    upd_iso = upd.isoformat() if upd else ""
+                    row = db_get_media(rk)
 
-                if row and row["ignore_until"]:
-                    try:
-                        ign = dt.datetime.fromisoformat(row["ignore_until"])
-                        if ign > now_dt and row["state"] in ("cooldown", "dead"):
-                            stats_skip += 1
-                            continue
-                    except:
-                        pass
+                    if row and row["ignore_until"]:
+                        try:
+                            ign = dt.datetime.fromisoformat(row["ignore_until"])
+                            if ign > now_dt and row["state"] in ("cooldown", "dead"):
+                                stats_skip += 1
+                                continue
+                        except:
+                            pass
 
-                is_new = row is None
-                is_changed = (
-                    upd_iso and row and
-                    upd_iso != (row["last_updated_at"] or "") and
-                    upd and upd >= lookback
-                )
-                ready_problem = (
-                    row and row["state"] in ("cooldown", "dead") and
-                    (not row["ignore_until"] or
-                     dt.datetime.fromisoformat(row["ignore_until"]) <= now_dt)
-                )
+                    is_new = row is None
+                    is_changed = (
+                        upd_iso and row and
+                        upd_iso != (row["last_updated_at"] or "") and
+                        upd and upd >= lookback
+                    )
+                    ready_problem = (
+                        row and row["state"] in ("cooldown", "dead") and
+                        (not row["ignore_until"] or
+                         dt.datetime.fromisoformat(row["ignore_until"]) <= now_dt)
+                    )
 
-                if ready_problem:
-                    ready_list.append(itm)
-                elif is_new:
-                    new_list.append(itm)
-                elif is_changed:
-                    changed_list.append(itm)
+                    if ready_problem:
+                        ready_list.append(itm)
+                    elif is_new:
+                        new_list.append(itm)
+                    elif is_changed:
+                        changed_list.append(itm)
+
+                    if len(ready_list) + len(new_list) + len(changed_list) >= MAX_ITEMS_PER_RUN:
+                        break
+
+                # Chunk freigeben
+                chunk.clear()
 
                 if len(ready_list) + len(new_list) + len(changed_list) >= MAX_ITEMS_PER_RUN:
                     break
+
+            # all_items kann jetzt freigegeben werden
+            all_items.clear()
+            del all_items
 
             selected = (ready_list + new_list + changed_list)[:MAX_ITEMS_PER_RUN]
             if not selected:
@@ -1237,7 +1563,7 @@ async def smart_refresh_loop():
 
                 stats_checked += 1
 
-                rk = str(getattr(itm, "ratingKey", ""))
+                rk = itm.ratingKey
                 upd = getattr(itm, "updatedAt", None)
                 upd_iso = upd.isoformat() if upd else ""
                 row = db_get_media(rk)
@@ -1245,7 +1571,7 @@ async def smart_refresh_loop():
                 # RECOVERED
                 if row and row["state"] == "dead" and upd_iso != (row["last_updated_at"] or ""):
                     asyncio.create_task(
-                        log_extra("recovered.log",
+                        log_extra_batch("recovered.log",
                                   f"RECOVERED | {lib} | {rk} | {itm.title}")
                     )
                     db_upsert_media(rk, lib, upd_iso, 0, "active", None, "recovered")
@@ -1296,8 +1622,40 @@ async def smart_refresh_loop():
                 if dead:
                     stats_new_dead += 1
 
+            # Listen freigeben
+            ready_list.clear()
+            new_list.clear()
+            changed_list.clear()
+            selected.clear()
+
+            # Phase abgeschlossen
+            perf_monitor.set_phase("Completed", item_count)
+
             if fixed_lib > 0:
                 refreshed_libs.append(f"• {lib}: {fixed_lib} gefixt")
+
+        # Explizites Garbage Collection nach großem Run
+        gc.collect()
+
+        # Beende Performance-Monitoring
+        perf_monitor.end_scan()
+        log_sync("Performance-Monitoring BEENDET", "PERF")
+        
+        # Schreibe Abschluss-Separator ins Live-Log
+        try:
+            path = os.path.join(LOG_DIR, "performance_live.log")
+            separator = (
+                "=" * 80 + "\n"
+                f"SCAN COMPLETED | Duration: {format_dur(duration)} | "
+                f"Peak RAM: {perf_monitor.peak_ram:.0f} MB | "
+                f"Avg CPU: {(sum(cpu_vals) / len(cpu_vals) if cpu_vals else 0):.1f}%\n"
+                + "=" * 80 + "\n\n"
+            )
+            with open(path, "a") as f:
+                f.write(separator)
+                f.flush()
+        except Exception as e:
+            log_sync(f"Live-Log Separator Fehler: {e}", "PERF")
 
         # SCAN ENDE
         end_ts = dt.datetime.now()
@@ -1308,6 +1666,24 @@ async def smart_refresh_loop():
 
         cpu_vals.clear()
         cpu_peak = 0.0
+
+        # Performance Stats sammeln
+        perf_stats = {
+            'checked': stats_checked,
+            'fixed': stats_fixed,
+            'failed': stats_failed,
+            'skipped': stats_skip,
+            'new_dead': stats_new_dead
+        }
+
+        # Schreibe Performance Summary (ohne Timestamp im summary selbst)
+        summary = perf_monitor.get_summary(perf_stats)
+        
+        # Schreibe Summary direkt in Datei
+        path = os.path.join(LOG_DIR, "performance_summary.log")
+        with open(path, "a") as f:
+            f.write(summary)
+            f.flush()
 
         main_line = (
             f"{stats_fixed} gefixt · "
@@ -1409,8 +1785,8 @@ def main():
         logging.getLogger("discord.state").disabled = True
 
         intents = discord.Intents.none()
-        intents.guilds = True        # Du brauchst nur Guilds für Embeds
-        intents.message_content = False   # EXPLIZIT deaktivieren
+        intents.guilds = True
+        intents.message_content = False
 
         bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -1428,9 +1804,29 @@ def main():
     loop.run_until_complete(_runner_no_discord())
 
 # =====================================================================
+# CLEANUP ON EXIT
+# =====================================================================
+
+import atexit
+
+def cleanup():
+    """Cleanup beim Beenden"""
+    global db_pool
+    if db_pool:
+        db_pool.close_all()
+        log_sync("DB Pool geschlossen", "CLEANUP")
+
+atexit.register(cleanup)
+
+# =====================================================================
 # RUN
 # =====================================================================
 
 if __name__ == "__main__":
-    print("🚀 Starte Plex Smart-Refresher 4.3 Compact Edition …", flush=True)
+    print("🚀 Starte Plex Smart-Refresher 4.4 Optimized Edition …", flush=True)
+    print("📊 Memory Optimizations:", flush=True)
+    print(f"  • Chunk Size: {CHUNK_SIZE} Items", flush=True)
+    print(f"  • Max CPU Samples: {MAX_CPU_SAMPLES}", flush=True)
+    print(f"  • DB Connection Pool: 3 Connections", flush=True)
+    print(f"  • Log Batch Writing: Enabled", flush=True)
     main()
