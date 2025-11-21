@@ -1654,18 +1654,23 @@ async def smart_refresh_loop():
         except Exception as e:
             log_sync(f"WAL Checkpoint Fehler: {e}", "DB")
 
+        # SCAN ENDE
+        end_ts = dt.datetime.now()
+        duration = (end_ts - start_ts).total_seconds()
+
         # Beende Performance-Monitoring
         perf_monitor.end_scan()
         log_sync("Performance-Monitoring BEENDET", "PERF")
         
         # Schreibe Abschluss-Separator ins Live-Log
         try:
+            avg_cpu = sum(cpu_vals) / len(cpu_vals) if cpu_vals else 0
             path = os.path.join(LOG_DIR, "performance_live.log")
             separator = (
                 "=" * 80 + "\n"
                 f"SCAN COMPLETED | Duration: {format_dur(duration)} | "
                 f"Peak RAM: {perf_monitor.peak_ram:.0f} MB | "
-                f"Avg CPU: {(sum(cpu_vals) / len(cpu_vals) if cpu_vals else 0):.1f}%\n"
+                f"Avg CPU: {avg_cpu:.1f}%\n"
                 + "=" * 80 + "\n\n"
             )
             with open(path, "a") as f:
@@ -1673,10 +1678,6 @@ async def smart_refresh_loop():
                 f.flush()
         except Exception as e:
             log_sync(f"Live-Log Separator Fehler: {e}", "PERF")
-
-        # SCAN ENDE
-        end_ts = dt.datetime.now()
-        duration = (end_ts - start_ts).total_seconds()
 
         avg_cpu = sum(cpu_vals) / len(cpu_vals) if cpu_vals else 0
         peak_cpu = cpu_peak
