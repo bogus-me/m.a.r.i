@@ -1,4 +1,4 @@
-# m.a.r.i
+# m.a.r.i 
 **M.A.R.I. – Metadata Auto Refresh Interface for Plex. Smart. Silent. Always fresh.**
 
 M.A.R.I. ist ein autonomes, containerbasiertes System, das deine Plex-Mediathek permanent überwacht und automatisch beschädigte, fehlende oder unvollständige Metadaten repariert.
